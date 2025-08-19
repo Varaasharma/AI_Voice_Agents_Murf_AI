@@ -1,14 +1,26 @@
 # backend/main.py
 import os
+import asyncio
 from typing import Dict, List
 
-from fastapi import FastAPI, File, UploadFile, Path
+from fastapi import FastAPI, File, UploadFile, Path, WebSocket
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 import assemblyai as aai
+# Updated imports: streaming v3 API (per AssemblyAI docs you provided)
+from assemblyai.streaming.v3 import (
+    StreamingClient,
+    StreamingClientOptions,
+    StreamingParameters,
+    StreamingEvents,
+    TurnEvent,
+    BeginEvent,
+    TerminationEvent,
+    StreamingError,
+)
 from murf import Murf
 import google.generativeai as genai
 
@@ -179,3 +191,203 @@ async def agent_chat(
             content=api_audio_fallback_payload("server_error", str(e)),
             status_code=200
         )
+
+# ---------------------------------------------------------
+# WebSocket endpoint (Day 12+ real-time upgrade)
+# ---------------------------------------------------------
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    print(f"WebSocket connected for session: {session_id}")
+
+    if not ASSEMBLYAI_API_KEY:
+        await websocket.send_json({"status": "error", "message": "No AssemblyAI API key"})
+        await websocket.close()
+        return
+
+    # -------------------------
+    # Create StreamingClient (AssemblyAI streaming v3)
+    # -------------------------
+    loop = asyncio.get_running_loop()
+    print("[WebSocket] Initializing AssemblyAI StreamingClient…")
+    client = StreamingClient(
+        StreamingClientOptions(
+            api_key=ASSEMBLYAI_API_KEY,
+            api_host="streaming.assemblyai.com",
+        )
+    )
+
+    # Event handlers
+    def _on_begin(self: StreamingClient, event: BeginEvent):
+        print(f"[AssemblyAI] Session started: {event.id}")
+
+    def _on_turn(self: StreamingClient, event: TurnEvent):
+        # event.transcript may be partial or final; forward to client
+        txt = getattr(event, "transcript", None)
+        is_final = getattr(event, "end_of_turn", False)
+        if txt:
+            print(f"[Transcript]{' [FINAL]' if is_final else ''} {txt}")
+            # Callback runs in a background thread; marshal to main event loop
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_json({
+                        "status": "transcript",
+                        "text": txt,
+                        "final": bool(is_final)
+                    }),
+                    loop,
+                )
+                if is_final:
+                    # Explicit turn-end signal for Day 18
+                    asyncio.run_coroutine_threadsafe(
+                        websocket.send_json({
+                            "status": "turn_end",
+                            "text": txt
+                        }),
+                        loop,
+                    )
+            except RuntimeError as e:
+                print(f"[Transcript] failed to dispatch to loop: {e}")
+
+            # If end_of_turn and not formatted, request formatted turns (optional)
+            try:
+                if event.end_of_turn and not event.turn_is_formatted:
+                    from assemblyai.streaming.v3 import StreamingSessionParameters
+                    params = StreamingSessionParameters(format_turns=True)
+                    self.set_params(params)
+            except Exception:
+                pass
+
+    def _on_terminated(self: StreamingClient, event: TerminationEvent):
+        print(f"[AssemblyAI] Session terminated: {event.audio_duration_seconds} seconds processed")
+
+    def _on_error(self: StreamingClient, error: StreamingError):
+        print(f"[AssemblyAI] Error: {error}")
+
+    # Register handlers
+    client.on(StreamingEvents.Begin, _on_begin)
+    client.on(StreamingEvents.Turn, _on_turn)
+    client.on(StreamingEvents.Termination, _on_terminated)
+    client.on(StreamingEvents.Error, _on_error)
+
+    # Connect with desired params (16 kHz)
+    print("[AssemblyAI] Connecting with sample_rate=16000…")
+    client.connect(
+        StreamingParameters(
+            sample_rate=16000,
+            format_turns=True,
+        )
+    )
+    print("[AssemblyAI] Connected.")
+
+    # Buffer in case you still want to save the file locally (kept as before)
+    audio_buffer = bytearray()
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if isinstance(message, dict):
+                mtype = message.get("type")
+                if mtype == "websocket.receive":
+                    if "bytes" in message:
+                        print(f"[WS<-] received {len(message['bytes'])} bytes")
+                    elif "text" in message:
+                        preview = (message["text"] or "")[:80]
+                        print(f"[WS<-] received text: {preview}")
+            # message may be dict-form (FastAPI) or bytes; handle both
+
+            # Binary chunk (FastAPI returns a dict with "bytes" key)
+            if isinstance(message, dict) and message.get("type") == "websocket.receive" and "bytes" in message:
+                audio_chunk = message["bytes"]
+                audio_buffer.extend(audio_chunk)
+                # Stream the raw bytes to AssemblyAI
+                try:
+                    # Assumes client.stream accepts bytes — per docs it accepts audio sources;
+                    # this call is safe in modern SDKs. Use await if stream is async.
+                    maybe_awaitable = client.stream(audio_chunk)
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
+                    print(f"[Aai->] streamed {len(audio_chunk)} bytes")
+                except Exception as e:
+                    print(f"[AssemblyAI] stream error: {e}")
+
+            # Binary directly (some FastAPI versions might give bytes)
+            elif isinstance(message, (bytes, bytearray)):
+                audio_chunk = bytes(message)
+                audio_buffer.extend(audio_chunk)
+                try:
+                    maybe_awaitable = client.stream(audio_chunk)
+                    if asyncio.iscoroutine(maybe_awaitable):
+                        await maybe_awaitable
+                    print(f"[Aai->] streamed {len(audio_chunk)} bytes (raw)")
+                except Exception as e:
+                    print(f"[AssemblyAI] stream error: {e}")
+
+            # Text message (end_of_audio event)
+            elif isinstance(message, dict) and message.get("type") == "websocket.receive" and "text" in message:
+                import json
+                try:
+                    data = json.loads(message["text"])
+                except Exception:
+                    data = None
+
+                if isinstance(data, dict) and data.get("event") == "end_of_audio":
+                    print("End of audio event received. Closing AssemblyAI stream.")
+                    # Give AssemblyAI a moment to flush and then disconnect/terminate
+                    try:
+                        # disconnect can be awaitable
+                        maybe_awaitable = client.disconnect(terminate=True)
+                        if asyncio.iscoroutine(maybe_awaitable):
+                            await maybe_awaitable
+                        print("[AssemblyAI] disconnect requested (terminate=True)")
+                    except Exception as e:
+                        print(f"[AssemblyAI] disconnect error: {e}")
+
+                    # optionally save audio to disk (preserve existing behavior)
+                    try:
+                        import uuid
+                        from datetime import datetime
+
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        unique_id = str(uuid.uuid4())[:8]
+                        filename = f"session_{session_id}_{timestamp}_{unique_id}.webm"
+                        filepath = os.path.join("uploads", filename)
+                        os.makedirs("uploads", exist_ok=True)
+                        with open(filepath, "wb") as f:
+                            f.write(bytes(audio_buffer))
+                        print(f"Audio file saved successfully: {filepath}")
+
+                        await websocket.send_json({
+                            "status": "success",
+                            "message": "Audio file saved successfully",
+                            "filename": filename,
+                            "filepath": filepath
+                        })
+                    except Exception as e:
+                        print(f"Error saving audio file: {e}")
+                        await websocket.send_json({
+                            "status": "error",
+                            "message": "Failed to save audio file",
+                            "error": str(e)
+                        })
+
+                    audio_buffer.clear()
+                    print("Audio buffer cleared after save")
+                    # Break the loop if you want to close socket after one recording
+                    # break
+
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+    finally:
+        # Make sure AssemblyAI client is disconnected
+        try:
+            maybe_awaitable = client.disconnect(terminate=True)
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+            print("[AssemblyAI] disconnect on finally")
+        except Exception:
+            pass
