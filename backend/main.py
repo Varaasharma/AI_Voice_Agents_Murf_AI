@@ -2,6 +2,7 @@
 import os
 import asyncio
 from typing import Dict, List
+import requests
 
 from fastapi import FastAPI, File, UploadFile, Path, WebSocket
 from fastapi.responses import JSONResponse, FileResponse
@@ -23,6 +24,8 @@ from assemblyai.streaming.v3 import (
 )
 from murf import Murf
 import google.generativeai as genai
+from google.generativeai import types
+
 import json
 
 # Optional: Murf WS
@@ -48,6 +51,84 @@ print(f"[DEBUG] GEMINI_API_KEY: {'*' * (len(GEMINI_API_KEY) - 4) + GEMINI_API_KE
 # Murf WS configuration
 MURF_WS_URL        = os.getenv("MURF_WS_URL") or "wss://api.murf.ai/v1/speech/stream-input"
 
+# ---------------------------------------------------------
+# Orion's Weather Lookup Skill
+# ---------------------------------------------------------
+def get_current_weather(location: str) -> dict:
+    """Gets the current weather for a given location using WeatherAPI.com.
+    
+    Args:
+        location: The city and state/country, e.g. "San Francisco, CA" or "London, UK"
+        
+    Returns:
+        A dictionary containing the weather information.
+    """
+    print(f"[WEATHER] FUNCTION CALLED with location: {location}")
+    
+    # You'll need to sign up for a free API key at https://www.weatherapi.com/
+    # Add this to your .env file: WEATHERAPI_KEY=your_api_key_here
+    WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY")
+    
+    if not WEATHERAPI_KEY:
+        return {
+            "error": "API key missing",
+            "location": location,
+            "message": "Please add WEATHERAPI_KEY to your .env file. Sign up at https://www.weatherapi.com/"
+        }
+    
+    try:
+        # Use WeatherAPI.com for real-time weather data
+        weather_url = f"http://api.weatherapi.com/v1/current.json?key={WEATHERAPI_KEY}&q={location}&aqi=no"
+        
+        print(f"[WEATHER] Fetching weather from WeatherAPI.com for: {location}")
+        weather_response = requests.get(weather_url, timeout=10)
+        weather_response.raise_for_status()
+        weather_data = weather_response.json()
+        
+        # Extract current weather data
+        current = weather_data["current"]
+        location_info = weather_data["location"]
+        
+        # Format the response in Orion's cool style
+        result = {
+            "location": f"{location_info['name']}, {location_info['country']}",
+            "temperature_celsius": current["temp_c"],
+            "temperature_fahrenheit": current["temp_f"],
+            "feels_like_celsius": current["feelslike_c"],
+            "feels_like_fahrenheit": current["feelslike_f"],
+            "humidity": current["humidity"],
+            "weather_description": current["condition"]["text"],
+            "wind_speed_kmh": current["wind_kph"],
+            "wind_speed_mph": current["wind_mph"],
+            "pressure_mb": current["pressure_mb"],
+            "visibility_km": current["vis_km"],
+            "uv_index": current["uv"],
+            "last_updated": current["last_updated"],
+            "coordinates": f"{location_info['lat']}, {location_info['lon']}"
+        }
+        
+        print(f"[WEATHER] Function returning result: {result}")
+        return result
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": "Network error",
+            "location": location,
+            "message": f"Failed to fetch weather data: {str(e)}"
+        }
+    except KeyError as e:
+        return {
+            "error": "Invalid response",
+            "location": location,
+            "message": f"Weather API returned unexpected data format: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "error": "Weather lookup failed",
+            "location": location,
+            "message": f"Unexpected error: {str(e)}"
+        }
+
 MURF_WS_CONTEXT_ID = os.getenv("MURF_WS_CONTEXT_ID") or "day20-context"
 
 if ASSEMBLYAI_API_KEY:
@@ -67,7 +148,7 @@ FALLBACK_LINE   = "I'm having trouble connecting right now."
 # ---------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------
-app = FastAPI(title="Voice Agent - Day 11 (API fallback)")
+app = FastAPI(title="Voice Agent - Day 25 (Weather Lookup)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,7 +171,26 @@ async def health():
         "assemblyai": bool(ASSEMBLYAI_API_KEY),
         "murf": bool(MURF_API_KEY),
         "gemini": bool(GEMINI_API_KEY),
+        "special_skills": ["weather_lookup"]
     }
+
+@app.get("/test-weather")
+async def test_weather():
+    """Test endpoint to verify weather function works with WeatherAPI.com"""
+    try:
+        result = get_current_weather("Delhi, India")
+        return {"status": "success", "result": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.get("/test-weather/{location}")
+async def test_weather_location(location: str):
+    """Test endpoint to verify weather function works for any location"""
+    try:
+        result = get_current_weather(location)
+        return {"status": "success", "result": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 # ---------------------------------------------------------
 # In-memory chat history
@@ -98,7 +198,9 @@ async def health():
 CHAT_STORE: Dict[str, List[Dict[str, str]]] = {}
 
 def get_history(session_id: str) -> List[Dict[str, str]]:
-    return CHAT_STORE.setdefault(session_id, [])
+    history = CHAT_STORE.setdefault(session_id, [])
+    print(f"[HISTORY] Getting history for session {session_id}: {len(history)} messages")
+    return history
 
 def append_turn(session_id: str, role: str, text: str) -> None:
     CHAT_STORE.setdefault(session_id, []).append({"role": role, "text": text})
@@ -119,12 +221,39 @@ def safe_transcribe(audio_bytes: bytes) -> str:
 def safe_llm(prompt: str) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing")
-    model = genai.GenerativeModel(LLM_MODEL)
-    resp = model.generate_content(prompt)
-    text = (getattr(resp, "text", "") or "").strip()
-    if not text:
-        raise RuntimeError("Empty LLM result")
-    return text
+    
+    try:
+        # Configure Gemini with weather tool
+        model = genai.GenerativeModel(LLM_MODEL)
+        
+        # Create tools configuration - weather lookup
+        tools = [get_current_weather]
+        
+        # Generate content with tools
+        response = model.generate_content(
+            prompt,
+            tools=tools,
+            generation_config=genai.types.GenerateContentConfig(
+                temperature=0.7,  # Slightly creative but controlled
+                top_p=0.8,
+                top_k=40
+            )
+        )
+        
+        text = (getattr(response, "text", "") or "").strip()
+        if not text:
+            raise RuntimeError("Empty LLM result")
+        return text
+        
+    except Exception as e:
+        print(f"[LLM] Function calling failed, falling back to basic generation: {e}")
+        # Fallback to basic generation if function calling fails
+        model = genai.GenerativeModel(LLM_MODEL)
+        response = model.generate_content(prompt)
+        text = (getattr(response, "text", "") or "").strip()
+        if not text:
+            raise RuntimeError("Empty LLM result")
+        return text
 
 def try_murf_tts(text: str) -> str | None:
     """Return Murf audio URL if possible, otherwise None."""
@@ -144,6 +273,41 @@ def try_murf_tts(text: str) -> str | None:
 def build_prompt_from_history(history: List[Dict[str, str]]) -> str:
     context = history[-CONTEXT_TURNS:]
     lines = []
+    
+    # Add Orion persona context
+    persona_context = (
+        "You are Orion, an AI voice agent with a crisp, clear, and approachable personality. "
+        "You have a touch of 'cool factor' with subtle futuristic references, but not overdone. "
+        "You are a reliable guide who gives accurate information and confirms when tasks are done. "
+        "You are an approachable partner who sounds conversational, not formal. "
+        "You are a patient teacher who explains step by step when asked. "
+        "You are a cool companion who sprinkles in light, modern phrasing that makes you feel fresh."
+    )
+    lines.append(f"Persona: {persona_context}")
+    
+    # Add system instruction to force function calling
+    system_instruction = (
+        "SYSTEM: You have access to the get_current_weather function. "
+        "When weather is requested, you MUST call this function. "
+        "Do not generate fake weather data or code examples. "
+        "Call the function and use the real data returned."
+    )
+    lines.append(f"System: {system_instruction}")
+    
+    # Add weather lookup skill context
+    skills_context = (
+        "Special Skill: You can look up current weather for any location worldwide using the get_current_weather function. "
+        "When users ask about weather, you MUST call get_current_weather(location) to get real-time data. "
+        "Do not make up weather information or generate fake responses. "
+        "Always provide weather information in your Orion persona style with a touch of cool factor. "
+        "CRITICAL: If the user asks about weather, you MUST call get_current_weather(location) function. "
+        "Never generate placeholder code or fake weather data. "
+        "The function will return real weather data that you should present to the user. "
+        "EXAMPLE: If user asks 'What's the weather in Delhi?', you MUST call get_current_weather('Delhi') and use the real data returned. "
+        "DO NOT write code examples or assume what the function returns. CALL THE FUNCTION FIRST, then respond with the real data."
+    )
+    lines.append(f"Skills: {skills_context}")
+    
     for m in context:
         prefix = "User:" if m["role"] == "user" else "Assistant:"
         lines.append(f"{prefix} {m['text']}")
@@ -248,8 +412,8 @@ async def close_murf_ws_session(ws, reader_task, context_id: str):
     if reader_task:
         reader_task.cancel()
 
-# keep your original single-shot helper (not used by streaming, but retained)
-async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str) -> None:
+# Updated function to stream audio back to client
+async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str, websocket: WebSocket = None) -> None:
     """Send text to Murf TTS over WebSocket and print base64 audio chunks to console."""
     if not MURF_API_KEY:
         print("[MurfWS] Missing MURF_API_KEY; skipping WS TTS")
@@ -260,8 +424,12 @@ async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str) -> Non
     if not text:
         return
 
-    # Murf API key goes in query params, not headers
-    ws_url = f"{MURF_WS_URL}?api-key={MURF_API_KEY}&sample_rate=44100&channel_type=MONO&format=WAV"
+    # Generate a unique context ID for each request to avoid conflicts
+    import time
+    unique_context_id = f"{context_id}-{int(time.time() * 1000)}"
+    
+    # Murf API key goes in query params, not headers (following Murf cookbook)
+    ws_url = f"{MURF_WS_URL}?api-key={MURF_API_KEY}&sample_rate=44100&channel_type=MONO&format=WAV&context_id={unique_context_id}"
     
     # Debug: Log the connection details
     print(f"[DEBUG] Murf WS URL: {ws_url}")
@@ -270,29 +438,33 @@ async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str) -> Non
     ws = None
     try:
         print(f"[MurfWS] Connecting to Murf WS (context_id={context_id})")
-        # Connect without custom headers - API key is in URL
+        # Connect without custom headers - API key is in URL (following Murf cookbook)
         ws = await websockets.connect(ws_url, max_size=None)
+        print(f"[MurfWS] Connected successfully to Murf WebSocket")
         
-        # Send voice config first (as per Murf example)
+        # Send voice config first (following Murf cookbook best practices)
         voice_config_msg = {
             "voice_config": {
                 "voiceId": voice_id,
                 "style": "Conversational",
-                "rate": 0,
-                "pitch": 0,
-                "variation": 1
+                "rate": 2,  # Slightly faster for Orion's crisp tone
+                "pitch": 1,  # Natural pitch
+                "variation": 0.8  # Subtle variation for naturalness
             }
         }
         print(f"[DEBUG] Murf Voice Config: {voice_config_msg}")
         await ws.send(json.dumps(voice_config_msg))
         
-        # Send text message (as per Murf example)
+        # Send text message (following Murf cookbook pattern)
         text_msg = {
             "text": text,
             "end": True  # Close context after this text
         }
         print(f"[DEBUG] Murf Text Message: {text_msg}")
         await ws.send(json.dumps(text_msg))
+        
+        # Wait a moment for Murf to process the text
+        await asyncio.sleep(0.1)
         
         print("[MurfWS] Text sent; awaiting audio chunks…")
         
@@ -303,18 +475,76 @@ async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str) -> Non
             try:
                 response = await ws.recv()
                 data = json.loads(response)
-                print(f"[MurfWS] Received: {data}")
+                print(f"[MurfWS] Received raw response: {response}")
+                print(f"[MurfWS] Parsed data: {data}")
+                print(f"[MurfWS] Data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                print(f"[MurfWS] Has 'audio' key: {'audio' in data if isinstance(data, dict) else False}")
+                print(f"[MurfWS] Has 'audio_base64' key: {'audio_base64' in data if isinstance(data, dict) else False}")
                 
+                # Check for errors first
+                if "error" in data:
+                    error_msg = data.get("error", "Unknown error")
+                    print(f"[MurfWS] ERROR from Murf: {error_msg}")
+                    if "context limit" in error_msg.lower():
+                        print("[MurfWS] Context limit exceeded - this should be resolved with unique context IDs")
+                    break
+                
+                # Check for audio data in various possible field names
+                audio_b64 = None
                 if "audio" in data:
-                    chunk_count += 1
                     audio_b64 = data["audio"]
+                    print(f"[MurfWS] Found audio in 'audio' field")
+                elif "audio_base64" in data:
+                    audio_b64 = data["audio_base64"]
+                    print(f"[MurfWS] Found audio in 'audio_base64' field")
+                elif "data" in data and isinstance(data["data"], str):
+                    audio_b64 = data["data"]
+                    print(f"[MurfWS] Found audio in 'data' field")
+                
+                if audio_b64:
+                    chunk_count += 1
                     print(f"[MurfWS] audio_base64 [chunk {chunk_count}]: {audio_b64[:64]}… (len={len(audio_b64)})")
-                    # Print the full base64 (as required by the task)
                     print(f"[MurfWS] FULL_BASE64_CHUNK_{chunk_count}:")
                     print(audio_b64)
+                    
+                    # Validate audio data
+                    if not audio_b64 or len(audio_b64) < 100:
+                        print(f"[MurfWS] WARNING: Audio chunk {chunk_count} seems too small: {len(audio_b64)} chars")
+                    else:
+                        print(f"[MurfWS] Audio chunk {chunk_count} looks good: {len(audio_b64)} chars")
+
+
+
+                    # Stream to client
+                    if websocket:
+                        try:
+                            await websocket.send_json({
+                                "status": "audio_chunk",
+                                "audio_base64": audio_b64,
+                                "chunk_index": chunk_count,
+                                "sample_rate": 44100,
+                                "total_length": len(audio_b64),
+                                "total_chunks": "streaming"  # Indicates streaming mode
+                            })
+                        except Exception as e:
+                            print(f"[MurfWS] Failed to send audio chunk to client: {e}")
                 
                 if data.get("final"):
                     print("[MurfWS] Synthesis completed (final=true)")
+                    
+                    # Send completion signal to client
+                    if websocket:
+                        try:
+                            await websocket.send_json(
+                            {
+                                "status": "audio_complete",
+                                "message": "Audio synthesis completed",
+                                "total_chunks": chunk_count
+                            }
+                            )
+                        except Exception as e:
+                            print(f"[MurfWS] Failed to send completion signal to client: {e}")
+                    
                     break
                     
             except websockets.exceptions.ConnectionClosed:
@@ -326,10 +556,32 @@ async def send_text_to_murf_ws(text: str, voice_id: str, context_id: str) -> Non
                 
     except Exception as e:
         print(f"[MurfWS] Connection error: {e}")
+        print(f"[MurfWS] Falling back to regular Murf API...")
+        
+        # Fallback to regular Murf API
+        try:
+            if murf_client:
+                url = murf_client.text_to_speech.generate(
+                    text=text[:MURF_CHAR_LIMIT],
+                    voice_id=voice_id
+                ).audio_file
+                if url:
+                    print(f"[MurfWS] Fallback successful, got URL: {url}")
+                    # Send fallback audio URL to client
+                    if websocket:
+                        await websocket.send_json({
+                            "status": "audio_fallback",
+                            "audio_url": url,
+                            "message": "Using fallback audio API"
+                        })
+                    return
+        except Exception as fallback_error:
+            print(f"[MurfWS] Fallback also failed: {fallback_error}")
     finally:
         try:
             if ws is not None:
                 await ws.close()
+                print(f"[MurfWS] Closed WebSocket connection for context_id={unique_context_id}")
         except Exception:
             pass
 
@@ -395,11 +647,41 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
+    # Get the event loop for async operations
+    loop = asyncio.get_running_loop()
+    
+    # Send welcome message on first connection
+    if len(get_history(session_id)) == 0:
+        welcome_text = "Hey there! I am Orion, your AI Voice Agent. How can I help you today?"
+        print(f"[WELCOME] Sending welcome message: {welcome_text}")
+        
+        # Add welcome message to conversation history
+        append_turn(session_id, "assistant", welcome_text)
+        print(f"[WELCOME] Added to conversation history. History length: {len(get_history(session_id))}")
+        
+        # Send welcome message to client
+        try:
+            await websocket.send_json({
+                "status": "welcome",
+                "text": welcome_text
+            })
+            print(f"[WELCOME] Welcome message sent to client successfully")
+        except Exception as e:
+            print(f"[WELCOME] Failed to send welcome message to client: {e}")
+        
+        # Send welcome message to Murf for TTS
+        try:
+            asyncio.create_task(send_text_to_murf_ws(welcome_text, VOICE_ID, MURF_WS_CONTEXT_ID, websocket))
+            print(f"[WELCOME] Murf TTS task created successfully")
+        except Exception as e:
+            print(f"[WELCOME] Failed to create Murf TTS task: {e}")
+    else:
+        print(f"[WELCOME] Session already has history ({len(get_history(session_id))} messages), skipping welcome")
+
     # -------------------------
     # Create StreamingClient (AssemblyAI streaming v3)
     # -------------------------
     print("[WebSocket] Initializing AssemblyAI StreamingClient…")
-    loop = asyncio.get_running_loop()
     client = StreamingClient(
         StreamingClientOptions(
             api_key=ASSEMBLYAI_API_KEY,
@@ -447,6 +729,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         print(f"[Transcript] Skipped duplicate: {txt}")
             except RuntimeError as e:
                 print(f"[Transcript] failed to dispatch to loop: {e}")
+                print(f"[Transcript] Loop variable: {loop}")
+                print(f"[Transcript] Loop type: {type(loop)}")
 
     def _on_terminated(self: StreamingClient, event: TerminationEvent):
         print(f"[AssemblyAI] Session terminated: {event.audio_duration_seconds} seconds processed")
@@ -580,7 +864,19 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                     audio_buffer.clear()
                     print("Audio buffer cleared after save")
-                    # break  # keep socket open for next turns if you want
+                    
+                    # Send ready_for_next message to keep WebSocket alive
+                    try:
+                        await websocket.send_json({
+                            "status": "ready_for_next",
+                            "message": "Ready for next recording"
+                        })
+                        print("[WebSocket] Sent ready_for_next message")
+                    except Exception as e:
+                        print(f"[WebSocket] Failed to send ready_for_next: {e}")
+                    
+                    # Keep socket open for next turns
+                    print("[WebSocket] Keeping WebSocket open for next recording session")
 
     except Exception as e:
         print(f"WebSocket error: {e}")
@@ -598,6 +894,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         except Exception:
             pass
 
+
+
 # ---------------- LLM Streaming -> Murf WS (Day 19 + Day 20) ----------------
 async def stream_llm_response(user_text: str, websocket: WebSocket, loop: asyncio.AbstractEventLoop, session_id: str):
     """Day 19+20: Stream LLM response; forward chunks to Murf WS; print base64 audio in console."""
@@ -612,20 +910,190 @@ async def stream_llm_response(user_text: str, websocket: WebSocket, loop: asynci
         prompt = build_prompt_from_history(get_history(session_id))
 
         print(f"[LLM] Streaming response...")
-        model = genai.GenerativeModel(LLM_MODEL)
-
-        # ---------- Stream Gemini response ----------
-        accumulated = ""
+        
         try:
+            # Use the correct Gemini API syntax for function calling
+            print(f"[LLM] Using correct Gemini API with function calling...")
+            
+            # Force function calling by being very explicit
+            enhanced_prompt = prompt + "\n\nIMPORTANT: The user is asking about weather. You MUST call get_current_weather() function. Do not generate fake data."
+            print(f"[LLM] Enhanced prompt: {enhanced_prompt[:300]}...")
+            
+            # Initialize accumulated variable
+            accumulated = ""
+            
+            # Use the correct Gemini API approach (following the official example)
+            try:
+                # Method 1: Use genai.Client() approach
+                client = genai.Client()
+                config = genai.types.GenerateContentConfig(
+                    tools=[get_current_weather]
+                )
+                
+                response = client.models.generate_content(
+                    model=LLM_MODEL,
+                    contents=enhanced_prompt,
+                    config=config
+                )
+                print(f"[LLM] Using genai.Client() approach")
+                
+            except Exception as client_error:
+                print(f"[LLM] Client approach failed: {client_error}")
+                
+                # Method 2: Use GenerativeModel with tools parameter
+                try:
+                    model = genai.GenerativeModel(LLM_MODEL)
+                    response = model.generate_content(
+                        enhanced_prompt,
+                        tools=[get_current_weather]
+                    )
+                    print(f"[LLM] Using GenerativeModel with tools parameter")
+                    
+                except Exception as model_error:
+                    print(f"[LLM] Model approach failed: {model_error}")
+                    
+                    # Method 3: Fallback to basic generation
+                    print(f"[LLM] All function calling methods failed, using basic generation")
+                    model = genai.GenerativeModel(LLM_MODEL)
+                    response = model.generate_content(enhanced_prompt)
+            
+            print(f"[LLM] Gemini response received: {response}")
+            print(f"[LLM] Response type: {type(response)}")
+            print(f"[LLM] Response attributes: {dir(response)}")
+            
+            # Check if function calling was used (multiple ways to detect)
+            function_called = False
+            
+            # Method 1: Check candidates
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content:
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'function_call'):
+                            print(f"[LLM] Function call detected: {part.function_call}")
+                            print(f"[LLM] Function name: {part.function_call.name}")
+                            print(f"[LLM] Function arguments: {part.function_call.args}")
+                            function_called = True
+                        elif hasattr(part, 'text'):
+                            print(f"[LLM] Text part: {part.text}")
+            
+            # Method 2: Check function_calls attribute
+            if hasattr(response, 'function_calls') and response.function_calls:
+                print(f"[LLM] Function calls found in response: {response.function_calls}")
+                function_called = True
+            
+            # Method 3: Check for function call in text
+            if "get_current_weather" in str(response):
+                print(f"[LLM] Function call reference found in response text")
+                function_called = True
+            
+            print(f"[LLM] Function calling status: {'SUCCESS' if function_called else 'FAILED'}")
+            
+            # If function calling succeeded, we need to execute the function and get a real response
+            if function_called:
+                print(f"[LLM] Function calling succeeded! Executing function and getting real response...")
+                
+                try:
+                                                        # Extract function call details
+                                    if hasattr(response, 'candidates') and response.candidates:
+                                        candidate = response.candidates[0]
+                                        if hasattr(candidate, 'content') and candidate.content:
+                                            for part in candidate.content.parts:
+                                                if hasattr(part, 'function_call'):
+                                                    func_name = part.function_call.name
+                                                    func_args = part.function_call.args
+                                                    
+                                                    print(f"[LLM] Executing function: {func_name} with args: {func_args}")
+                                                    
+                                                    # Convert protobuf args to dict
+                                                    args_dict = {}
+                                                    if hasattr(func_args, 'fields'):
+                                                        for key, value in func_args.fields.items():
+                                                            if hasattr(value, 'string_value'):
+                                                                args_dict[key] = value.string_value
+                                                            elif hasattr(value, 'number_value'):
+                                                                args_dict[key] = value.number_value
+                                                            else:
+                                                                args_dict[key] = str(value)
+                                                    
+                                                    print(f"[LLM] Converted args: {args_dict}")
+                                                    
+                                                                                        # Execute the weather function
+                                    if func_name == "get_current_weather":
+                                        location = args_dict.get("location", "Unknown")
+                                        weather_result = get_current_weather(location)
+                                        print(f"[LLM] Weather function result: {weather_result}")
+                                        
+                                        # Now ask Gemini to generate a response with the real weather data
+                                        follow_up_prompt = f"""
+The user asked about weather in {location}. Here's the real weather data from the API:
+
+{weather_result}
+
+Please provide a natural, conversational response in Orion's style using this real weather data. 
+Do not mention function calls or technical details. Just give the weather information naturally.
+"""
+                                        
+                                        print(f"[LLM] Sending follow-up prompt with real weather data...")
+                                        follow_up_response = model.generate_content(follow_up_prompt)
+                                        accumulated = (getattr(follow_up_response, "text", "") or "").strip()
+                                        print(f"[LLM] Follow-up response with real weather: {accumulated}")
+                                        
+                                        # Send the real weather response
+                                        if accumulated:
+                                            try:
+                                                await websocket.send_json({"status": "llm_chunk", "text": accumulated})
+                                                print(f"[LLM] Sent real weather response as chunk")
+                                            except Exception as e:
+                                                print(f"[LLM] Failed to send real weather chunk: {e}")
+                                        else:
+                                            print(f"[LLM] No accumulated response from follow-up")
+                                        
+                                        # Found and executed the function, so we're done
+                                        return
+                except Exception as func_error:
+                    print(f"[LLM] Error executing function: {func_error}")
+                    import traceback
+                    traceback.print_exc()
+                    # Fall through to basic generation
+                    function_called = False
+            
+            # If function calling failed or we need to fall back
+            if not function_called:
+                accumulated = (getattr(response, "text", "") or "").strip()
+                print(f"[LLM] Extracted text from response: '{accumulated}'")
+                
+                # Send the complete response as a single chunk for function calling
+                if accumulated:
+                    print(f"[LLM] Function calling response: {accumulated}")
+                    try:
+                        await websocket.send_json({"status": "llm_chunk", "text": accumulated})
+                        print(f"[LLM] Sent function calling response as chunk")
+                    except Exception as e:
+                        print(f"[LLM] Failed to send function calling chunk: {e}")
+            
+            # Ensure accumulated has a value (fallback)
+            if not accumulated:
+                accumulated = "I apologize, but I'm having trouble processing your request right now. Could you try rephrasing your question?"
+                print(f"[LLM] Using fallback response: {accumulated}")
+            
+        except Exception as e:
+            print(f"[LLM] Function calling failed, falling back to basic generation: {e}")
+            print(f"[LLM] Error details: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to basic generation if function calling fails
+            model = genai.GenerativeModel(LLM_MODEL)
             response = model.generate_content(prompt, stream=True)
+            
+            accumulated = ""
             for chunk in response:
                 part = getattr(chunk, "text", "") or ""
                 if not part.strip():
                     continue
-
                 accumulated += part
                 print(f"[LLM][chunk] {part}")
-
+                
                 # Optional: echo to client
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -635,33 +1103,36 @@ async def stream_llm_response(user_text: str, websocket: WebSocket, loop: asynci
                 except Exception as e:
                     print(f"[LLM] client send error: {e}")
 
-        except Exception as e:
-            print(f"[LLM] Streaming error: {e}")
-            return
-
         # ---------- Send complete response to Murf WS ----------
         if accumulated:
             print(f"[LLM] Final response: {accumulated}")
+            print(f"[LLM] Adding assistant response to conversation history")
             append_turn(session_id, "assistant", accumulated)
             
             # Day 20: Send complete response to Murf WS
-            await send_text_to_murf_ws(accumulated, VOICE_ID, MURF_WS_CONTEXT_ID)
+            print(f"[LLM] Sending response to Murf TTS...")
+            await send_text_to_murf_ws(accumulated, VOICE_ID, MURF_WS_CONTEXT_ID, websocket)
+            print(f"[LLM] Murf TTS completed")
             
             # Send completion signal to client
             try:
-                asyncio.create_task(websocket.send_json({
+                print(f"[LLM] Sending llm_complete message to client...")
+                await websocket.send_json({
                     "status": "llm_complete",
                     "text": accumulated
-                }))
+                })
+                print(f"[LLM] Sent llm_complete message to client successfully")
             except Exception as e:
                 print(f"[LLM] completion send error: {e}")
+        else:
+            print(f"[LLM] No accumulated response to send")
 
     except Exception as e:
         print(f"[LLM] General error: {e}")
         try:
-            asyncio.create_task(websocket.send_json({
+            await websocket.send_json({
                 "status": "llm_error",
                 "error": str(e)
-            }))
+            })
         except Exception:
             pass

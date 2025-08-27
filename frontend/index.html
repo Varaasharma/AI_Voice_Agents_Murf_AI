@@ -40,7 +40,7 @@
     /* Mic button */
     .mic {
       width: 112px; height: 112px; border-radius: 999px; border: none;
-      background: radial-gradient(circle at 30% 30%, #8ec5ff, var(--accent));
+      background: radial-gradient(circle at 30% 30%, #8ec5ff, var(--accent)); /* idle blue */
       color: #0b1220; cursor: pointer;
       display: grid; place-items: center;
       box-shadow: 0 10px 28px rgba(96,165,250,.45), inset 0 0 24px rgba(255,255,255,.15);
@@ -51,8 +51,10 @@
 
     /* Mic icon */
     .mic svg { width: 46px; height: 46px; }
-    .mic.rec { background: radial-gradient(circle at 30% 30%, #ffd599, var(--warn)); box-shadow: 0 10px 28px rgba(245,158,11,.45), inset 0 0 24px rgba(255,255,255,.18); }
-    .mic.proc { background: radial-gradient(circle at 30% 30%, #b0d9ff, var(--accent)); animation: pulse 1.2s infinite ease-in-out; }
+    /* New mic states without pulsing */
+    .mic.idle { background: radial-gradient(circle at 30% 30%, #8ec5ff, var(--accent)); box-shadow: 0 10px 28px rgba(96,165,250,.45), inset 0 0 24px rgba(255,255,255,.15); }
+    .mic.rec-green { background: radial-gradient(circle at 30% 30%, #b5f5d6, var(--accent-2)); box-shadow: 0 10px 28px rgba(52,211,153,.45), inset 0 0 24px rgba(255,255,255,.18); }
+    .mic.proc-red { background: radial-gradient(circle at 30% 30%, #ffb3b3, var(--danger)); box-shadow: 0 10px 28px rgba(248,113,113,.45), inset 0 0 24px rgba(255,255,255,.18); }
     .mic.play { background: radial-gradient(circle at 30% 30%, #9ff3cf, var(--accent-2)); box-shadow: 0 10px 28px rgba(52,211,153,.45), inset 0 0 24px rgba(255,255,255,.18); }
 
     /* Status */
@@ -106,7 +108,16 @@
 
     <section class="panel">
       <div class="stack">
-        <button id="micBtn" class="mic" aria-label="Record">
+        <!-- Conversation history moved above mic -->
+        <div id="conversation" style="margin-top:0; max-height:320px; overflow-y:auto; text-align:left; width:100%; display:none;">
+          <div style="font-size:12px; color: var(--muted); margin-bottom:8px;">Conversation</div>
+          <div id="conversation-content"></div>
+        </div>
+
+        <!-- Waveform (visible only while recording) -->
+        <canvas id="waveform" width="720" height="72" style="display:none; width:100%; max-width:720px; height:72px; border-radius:8px; background: rgba(255,255,255,0.03);"></canvas>
+
+        <button id="micBtn" class="mic idle" aria-label="Record">
           <!-- Mic icon -->
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3z"></path>
@@ -119,18 +130,19 @@
           <span id="status">Tap to start recording!</span>
         </div>
 
-        <div id="bars" class="bars" aria-hidden="true">
-          <div class="bar"></div><div class="bar"></div><div class="bar"></div>
-          <div class="bar"></div><div class="bar"></div><div class="bar"></div>
-          <div class="bar"></div><div class="bar"></div><div class="bar"></div>
-        </div>
+        <!-- bars removed; waveform used instead -->
 
         <div id="error" class="error"></div>
-        <div class="hint">Tip: short, specific prompts work best. Recording restarts after each reply.</div>
+        <div class="hint">💡 Pro tip: Try asking me anything! I'm great with questions, stories, or just casual chat.</div>
+        
+        <!-- Test button for debugging audio -->
+        <button id="testAudio" style="margin-top: 10px; padding: 8px 16px; background: #666; color: white; border: none; border-radius: 4px; cursor: pointer;">
+          Test Audio Context
+        </button>
 
-        <!-- New transcript container -->
+        <!-- Live transcript container -->
         <div id="transcript" class="hint" style="margin-top:12px; font-size:14px; color:#34d399;">
-        Live transcript will appear here...
+        I'm listening... speak clearly and I'll show you what I hear!
         </div>
 
         <audio id="llmAudio" crossorigin="anonymous"></audio>
